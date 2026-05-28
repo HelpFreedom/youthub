@@ -154,6 +154,7 @@ static int  update_sponsor_overlay(void);
 static void draw_speed_overlay(int win_w, int win_h, int video_x);
 static void draw_seek_overlay(int win_w, int win_h, int video_x);
 static void draw_sponsor_overlay(int win_w, int win_h, int video_x);
+static void draw_playback_hud(struct VideoState *is, int win_w, int win_h, int video_x);
 static void trigger_speed_overlay(double speed);
 static void trigger_seek_overlay(double delta_sec);
 static void trigger_sponsor_overlay(const char *category,
@@ -1388,6 +1389,109 @@ static int draw_speed_text(int x, int y, int scale, const char *text,
     return pen_x - x;
 }
 
+/* Persistent playback HUD at the bottom of the video area:
+ * - progress slider (master clock / container duration)
+ * - current/total time in seconds
+ * - volume mini-bars
+ * - current speed (x1.0 / x2.0 / ...)
+ *
+ * Deliberately uses primitive SDL rectangles + the built-in 3x5 bitmap
+ * glyphs so we stay compatible with SDL2 baseline (no SDL_ttf dependency).
+ */
+static void draw_playback_hud(VideoState *is, int win_w, int win_h, int video_x) {
+    if (!is) return;
+    int video_w = win_w - video_x;
+    if (video_w < 180 || win_h < 80) return;
+
+    int panel_h = 34;
+    int panel_x = video_x + 12;
+    int panel_w = video_w - 24;
+    int panel_y = win_h - panel_h - 10;
+    if (panel_w < 120) return;
+
+    SDL_Rect shadow = { panel_x + 2, panel_y + 2, panel_w, panel_h };
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 120);
+    SDL_RenderFillRect(renderer, &shadow);
+
+    SDL_Rect panel = { panel_x, panel_y, panel_w, panel_h };
+    SDL_SetRenderDrawColor(renderer, 20, 20, 24, 210);
+    SDL_RenderFillRect(renderer, &panel);
+
+    SDL_SetRenderDrawColor(renderer, 70, 70, 78, 255);
+    SDL_Rect top = { panel_x, panel_y, panel_w, 1 };
+    SDL_RenderFillRect(renderer, &top);
+
+    double pos_sec = get_master_clock(is);
+    if (isnan(pos_sec) || pos_sec < 0.0) pos_sec = 0.0;
+    double dur_sec = NAN;
+    if (is->ic && is->ic->duration > 0)
+        dur_sec = is->ic->duration / (double)AV_TIME_BASE;
+
+    int cur_s = (int)(pos_sec + 0.5);
+    int total_s = (!isnan(dur_sec) && dur_sec > 0.0) ? (int)(dur_sec + 0.5) : 0;
+    double ratio = (!isnan(dur_sec) && dur_sec > 0.1) ? pos_sec / dur_sec : 0.0;
+    if (ratio < 0.0) ratio = 0.0;
+    if (ratio > 1.0) ratio = 1.0;
+
+    int left_info_w = 56;
+    int right_info_w = 84;
+    int track_x = panel_x + left_info_w;
+    int track_w = panel_w - left_info_w - right_info_w;
+    if (track_w < 40) track_w = 40;
+    int track_h = 6;
+    int track_y = panel_y + 10;
+
+    SDL_Rect rail = { track_x, track_y, track_w, track_h };
+    SDL_SetRenderDrawColor(renderer, 52, 52, 60, 255);
+    SDL_RenderFillRect(renderer, &rail);
+
+    int fill_w = (int)(ratio * track_w);
+    if (fill_w > 0) {
+        SDL_Rect fill = { track_x, track_y, fill_w, track_h };
+        SDL_SetRenderDrawColor(renderer, 239, 206, 106, 255);
+        SDL_RenderFillRect(renderer, &fill);
+    }
+
+    int thumb_x = track_x + fill_w - 2;
+    if (thumb_x < track_x) thumb_x = track_x;
+    if (thumb_x > track_x + track_w - 3) thumb_x = track_x + track_w - 3;
+    SDL_Rect thumb = { thumb_x, track_y - 2, 4, track_h + 4 };
+    SDL_SetRenderDrawColor(renderer, 255, 232, 153, 255);
+    SDL_RenderFillRect(renderer, &thumb);
+
+    char cur_buf[24], total_buf[24], speed_buf[24];
+    snprintf(cur_buf, sizeof(cur_buf), "%ds", cur_s);
+    if (total_s > 0) snprintf(total_buf, sizeof(total_buf), "%ds", total_s);
+    else snprintf(total_buf, sizeof(total_buf), "--s");
+    snprintf(speed_buf, sizeof(speed_buf), "%.1fx", playback_speed);
+
+    draw_speed_text(panel_x + 8, panel_y + 7, 2, cur_buf, 220, 220, 220, 255);
+    draw_speed_text(track_x + track_w - 6 * 4, panel_y + 7, 2, total_buf, 170, 170, 178, 255);
+
+    /* Right cluster: volume bars + speed text. */
+    int vol = is->muted ? 0 : (int)(is->audio_volume * 100.0 / SDL_MIX_MAXVOLUME + 0.5);
+    if (vol < 0) vol = 0;
+    if (vol > 100) vol = 100;
+    int bars = (vol + 19) / 20;
+    int bx = panel_x + panel_w - 70;
+    int by = panel_y + 21;
+    int i;
+    for (i = 0; i < 5; i++) {
+        int h = 3 + i * 2;
+        SDL_Rect b = { bx + i * 5, by - h, 3, h };
+        if (i < bars) SDL_SetRenderDrawColor(renderer, 239, 206, 106, 255);
+        else SDL_SetRenderDrawColor(renderer, 90, 90, 98, 255);
+        SDL_RenderFillRect(renderer, &b);
+    }
+    if (is->muted) {
+        SDL_SetRenderDrawColor(renderer, 200, 90, 90, 255);
+        SDL_Rect m = { bx - 6, by - 10, 2, 12 };
+        SDL_RenderFillRect(renderer, &m);
+    }
+
+    draw_speed_text(panel_x + panel_w - 34, panel_y + 20, 2, speed_buf, 220, 220, 220, 255);
+}
+
 /* The centered overlay: rounded-ish dark plate with 3 chevrons (lit
  * up to `speed_anim_value`) and the speed in a small caption. Pops
  * in with overshoot, holds, then fades out. */
@@ -2300,6 +2404,7 @@ static void video_display(VideoState *is)
     draw_speed_overlay(is->width, is->height, sidebar_offset_px);
     draw_seek_overlay(is->width, is->height, sidebar_offset_px);
     draw_sponsor_overlay(is->width, is->height, sidebar_offset_px);
+    draw_playback_hud(is, is->width, is->height, sidebar_offset_px);
 
     SDL_RenderPresent(renderer);
 
