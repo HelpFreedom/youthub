@@ -9,6 +9,7 @@ We default to None / empty rather than crashing.
 """
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -151,6 +152,82 @@ def parse_tile(tile: dict) -> Optional[Video]:
     )
 
 
+def parse_video_renderer(node: dict) -> Optional[Video]:
+    """Parse WEB/TV search item renderers (not only tileRenderer)."""
+    vr = (
+        node.get("videoRenderer")
+        or node.get("gridVideoRenderer")
+        or node.get("compactVideoRenderer")
+        or node.get("playlistVideoRenderer")
+    )
+    if not vr:
+        return None
+
+    video_id = vr.get("videoId")
+    if not video_id:
+        nav = vr.get("navigationEndpoint") or vr.get("command", {})
+        if isinstance(nav, dict):
+            watch = nav.get("watchEndpoint") or {}
+            video_id = watch.get("videoId")
+    if not video_id or len(video_id) != 11:
+        return None
+
+    title = _text(vr.get("title")) or _text(vr.get("headline")) or ""
+    thumb_url = _best_thumbnail(
+        (vr.get("thumbnail") or {}).get("thumbnails", [])
+    )
+
+    channel = None
+    owner = vr.get("ownerText") or vr.get("longBylineText") or vr.get("shortBylineText")
+    if owner:
+        channel = _text(owner)
+
+    views = _text(vr.get("viewCountText")) or _text(vr.get("shortViewCountText"))
+    age = _text(vr.get("publishedTimeText"))
+
+    duration = None
+    for key in ("lengthText", "thumbnailOverlays"):
+        if key == "lengthText":
+            duration = _text(vr.get("lengthText"))
+            if duration:
+                break
+        for ov in vr.get("thumbnailOverlays", []) or []:
+            ts = ov.get("thumbnailOverlayTimeStatusRenderer")
+            if ts:
+                duration = _text(ts.get("text"))
+                break
+        if duration:
+            break
+
+    return Video(
+        video_id=video_id,
+        title=title,
+        channel=channel,
+        views=views,
+        age=age,
+        duration=duration,
+        thumbnail_url=thumb_url,
+    )
+
+
+def _videos_from_list_items(items: list) -> list[Video]:
+    """Extract videos from a horizontal list / item section."""
+    out: list[Video] = []
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        tile = it.get("tileRenderer")
+        if tile:
+            v = parse_tile(tile)
+            if v:
+                out.append(v)
+                continue
+        v = parse_video_renderer(it)
+        if v:
+            out.append(v)
+    return out
+
+
 def parse_shelf(shelf_node: dict) -> Optional[Shelf]:
     """Parse one shelfRenderer into a Shelf with its videos."""
     sh = shelf_node.get("shelfRenderer")
@@ -167,19 +244,11 @@ def parse_shelf(shelf_node: dict) -> Optional[Shelf]:
         or "<untitled>"
     )
 
-    items = (
-        sh.get("content", {})
-        .get("horizontalListRenderer", {})
-        .get("items", [])
-    )
-    videos: list[Video] = []
-    for it in items:
-        tile = it.get("tileRenderer")
-        if not tile:
-            continue
-        v = parse_tile(tile)
-        if v:
-            videos.append(v)
+    content = sh.get("content", {})
+    items = content.get("horizontalListRenderer", {}).get("items", [])
+    if not items:
+        items = content.get("gridShelfViewModel", {}).get("contents", [])
+    videos = _videos_from_list_items(items)
     return Shelf(title=title, videos=videos)
 
 
@@ -191,6 +260,11 @@ def _walk_sections(sections: list) -> Feed:
             sh = parse_shelf(sec)
             if sh:
                 feed.shelves.append(sh)
+        elif "itemSectionRenderer" in sec:
+            contents = sec["itemSectionRenderer"].get("contents", [])
+            vids = _videos_from_list_items(contents)
+            if vids:
+                feed.shelves.append(Shelf(title="Результаты", videos=vids))
         elif "continuationItemRenderer" in sec:
             cont = (
                 sec["continuationItemRenderer"]
@@ -216,18 +290,172 @@ def parse_home(raw: dict) -> Feed:
     return _walk_sections(sections)
 
 
-def parse_search(raw: dict) -> Feed:
-    """Parse a TVHTML5 /search response into a Feed.
+def _search_section_lists(raw: dict) -> list[list]:
+    """Collect section-list ``contents`` arrays from search JSON."""
+    found: list[list] = []
 
-    Same shape as home — sectionListRenderer → shelfRenderer →
-    horizontalListRenderer → tileRenderer — just without the
-    `tvBrowseRenderer` wrapper that home uses.
-    """
+    def add(sections: object) -> None:
+        if isinstance(sections, list) and sections:
+            found.append(sections)
+
     try:
-        sections = raw["contents"]["sectionListRenderer"]["contents"]
+        add(raw["contents"]["sectionListRenderer"]["contents"])
     except (KeyError, TypeError):
-        return Feed()
-    return _walk_sections(sections)
+        pass
+    try:
+        add(raw["contents"]["tvSearchRenderer"]["content"]
+            ["sectionListRenderer"]["contents"])
+    except (KeyError, TypeError):
+        pass
+    try:
+        add(raw["contents"]["twoColumnSearchResultsRenderer"]
+            ["primaryContents"]["sectionListRenderer"]["contents"])
+    except (KeyError, TypeError):
+        pass
+    try:
+        add(raw["contents"]["tvBrowseRenderer"]["content"]
+            ["tvSurfaceContentRenderer"]["content"]
+            ["sectionListRenderer"]["contents"])
+    except (KeyError, TypeError):
+        pass
+    return found
+
+
+def parse_search(raw: dict) -> Feed:
+    """Parse InnerTube /search (TV or WEB-shaped JSON)."""
+    feed = Feed()
+    seen: set[str] = set()
+
+    for sections in _search_section_lists(raw):
+        part = _walk_sections(sections)
+        feed.continuation = feed.continuation or part.continuation
+        for sh in part.shelves:
+            uniq: list[Video] = []
+            for v in sh.videos:
+                if v.video_id in seen:
+                    continue
+                seen.add(v.video_id)
+                uniq.append(v)
+            if uniq:
+                feed.shelves.append(Shelf(title=sh.title, videos=uniq))
+
+    # Fallback: walk renderers (WEB search often nests videoRenderer deeply).
+    if not feed.shelves:
+        extras: list[Video] = []
+
+        def walk(obj: object, depth: int = 0) -> None:
+            if depth > 22 or len(extras) > 80:
+                return
+            if isinstance(obj, dict):
+                if any(k in obj for k in (
+                    "videoRenderer", "gridVideoRenderer",
+                    "compactVideoRenderer", "tileRenderer",
+                )):
+                    v = parse_video_renderer(obj)
+                    if not v and "tileRenderer" in obj:
+                        v = parse_tile(obj["tileRenderer"])
+                    if v and v.video_id not in seen:
+                        seen.add(v.video_id)
+                        extras.append(v)
+                for v in obj.values():
+                    walk(v, depth + 1)
+            elif isinstance(obj, list):
+                for x in obj[:60]:
+                    walk(x, depth + 1)
+
+        walk(raw.get("contents", raw))
+        if extras:
+            feed.shelves.append(Shelf(title="Результаты", videos=extras))
+
+    return feed
+
+
+def parse_browse_continuation(raw: dict) -> Feed:
+    """Parse a browse continuation page (home/search section list).
+
+    Continuation responses may omit the ``tvBrowseRenderer`` wrapper and
+    expose ``sectionListRenderer`` directly — try both shapes.
+    """
+    for path in (
+        lambda r: r["contents"]["tvBrowseRenderer"]["content"]
+        ["tvSurfaceContentRenderer"]["content"]["sectionListRenderer"]["contents"],
+        lambda r: r["contents"]["sectionListRenderer"]["contents"],
+        lambda r: r["onResponseReceivedActions"][0]["appendContinuationItemsAction"]
+        ["continuationItems"],
+    ):
+        try:
+            sections = path(raw)
+            if sections:
+                return _walk_sections(sections)
+        except (KeyError, TypeError, IndexError):
+            continue
+    return Feed()
+
+
+def flatten_shelves_interleaved(feed: Feed) -> tuple[list[Video], list[str]]:
+    """Round-robin across shelves — closer to YouTube's mixed home rows."""
+    if not feed.shelves:
+        return [], []
+    max_len = max(len(sh.videos) for sh in feed.shelves)
+    videos: list[Video] = []
+    shelf_of: list[str] = []
+    for i in range(max_len):
+        for sh in feed.shelves:
+            if i < len(sh.videos):
+                videos.append(sh.videos[i])
+                shelf_of.append(sh.title)
+    return videos, shelf_of
+
+
+def merge_feeds_for_grid(feeds: list[Feed], *, interleave: bool = True
+                         ) -> tuple[list[Video], list[str]]:
+    """Merge several feeds; dedupe by video_id, keep first shelf label."""
+    seen: set[str] = set()
+    videos: list[Video] = []
+    shelf_of: list[str] = []
+    for feed in feeds:
+        if interleave:
+            chunk_v, chunk_s = flatten_shelves_interleaved(feed)
+        else:
+            chunk_v, chunk_s = [], []
+            for sh in feed.shelves:
+                for v in sh.videos:
+                    chunk_v.append(v)
+                    chunk_s.append(sh.title)
+        for v, label in zip(chunk_v, chunk_s):
+            if v.video_id in seen:
+                continue
+            seen.add(v.video_id)
+            videos.append(v)
+            shelf_of.append(label)
+    return videos, shelf_of
+
+
+def pivot_seed_ids(home: Feed, *, max_seeds: int = 4) -> list[str]:
+    """Pick diverse seeds for ``/next`` pivot — one per shelf, then random fill."""
+    seeds: list[str] = []
+    seen: set[str] = set()
+    for sh in home.shelves:
+        if not sh.videos:
+            continue
+        vid = sh.videos[0].video_id
+        if vid not in seen:
+            seeds.append(vid)
+            seen.add(vid)
+        if len(seeds) >= max_seeds:
+            return seeds
+    rest = [
+        v.video_id
+        for sh in home.shelves
+        for v in sh.videos
+        if v.video_id not in seen
+    ]
+    random.shuffle(rest)
+    for vid in rest:
+        seeds.append(vid)
+        if len(seeds) >= max_seeds:
+            break
+    return seeds
 
 
 def parse_next_pivot(raw: dict) -> Feed:

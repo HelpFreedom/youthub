@@ -45,12 +45,27 @@ from typing import Optional
 PROJECT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_DIR))
 
-import bootstrap as bs_mod  # noqa: E402
+import re
+
 import sponsorblock as sb_mod  # noqa: E402
 from watchstats import WatchStats  # noqa: E402
 
 
 FFPLAY_YT = PROJECT_DIR / "ffplay-yt" / "bin" / "ffplay-yt"
+
+
+def _video_id_from_url(url: str) -> str:
+    """Extract YouTube video ID (same rules as bootstrap.video_id_from_url)."""
+    m = re.search(r"[?&]v=([A-Za-z0-9_-]{11})", url)
+    if m:
+        return m.group(1)
+    m = re.search(r"youtu\.be/([A-Za-z0-9_-]{11})", url)
+    if m:
+        return m.group(1)
+    m = re.search(r"/(?:embed|shorts)/([A-Za-z0-9_-]{11})", url)
+    if m:
+        return m.group(1)
+    raise ValueError(f"could not extract video id from URL: {url!r}")
 
 # 2 MB ≈ a couple of seconds of 1080p — buffer between current playhead
 # and "must restart" decision so we don't trigger restarts on jitter.
@@ -803,7 +818,7 @@ def main() -> int:
         print("usage: bridge_player.py <video_id|url>", file=sys.stderr)
         return 2
     arg = sys.argv[1]
-    vid = bs_mod.video_id_from_url(arg) if arg.startswith("http") else arg
+    vid = _video_id_from_url(arg) if arg.startswith("http") else arg
     title = f"YouTube — {vid}"
     p = start_player(vid, window_title=title)
     try:
