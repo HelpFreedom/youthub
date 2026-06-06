@@ -37,6 +37,11 @@ NEXT_CACHE = Path(__file__).resolve().parent / "cache" / "innertube_next.json"
 HOME_TTL_SECS = 120  # short — we want fresh stuff on reload
 ERROR_LOG = Path(__file__).resolve().parent / "cache" / "grid_debug.log"
 KEY_LOG = Path(__file__).resolve().parent / "cache" / "grid_keys.log"
+SESSION_LOG = Path(__file__).resolve().parent / "cache" / "session.log"
+
+# Краткое сообщение в строке подсказок (обновление, поиск, …).
+_status_banner: str = ""
+_status_banner_until: float = 0.0
 
 # Time the focused tile must be unchanged before the hover preview starts.
 HOVER_DELAY = 3.0
@@ -53,6 +58,22 @@ _screen_lock = threading.Lock()
 QUIT_KEYS   = {"q", "Q", "й", "Й"}
 RELOAD_KEYS = {"r", "R", "к", "К"}
 SEARCH_KEYS = {"f", "F", "а", "А"}
+
+# Подсказки в нижней строке (см. draw_status). От короткой к полной.
+_STATUS_HOTKEYS = (
+    "hjkl · Enter · f · r · PgUp/Dn · Home · q",
+    "hjkl · Enter · f поиск · r обновить · PgUp/Dn · Home · q выход",
+    "←↑↓→/hjkl · Enter воспр. · f поиск · r обновить · "
+    "PgUp/PgDn листать · Home · q выход",
+)
+# Нижняя «хром»-полоса: подсказки (тёмная) + заголовок (инверсия, как было).
+_STATUS_HINT_STYLE = "\033[48;5;236;38;5;250m"   # тёмно-серый фон, светлый текст
+_STATUS_TITLE_STYLE = "\033[7m"                  # инвертированный (белая полоса)
+
+# Удержание стрелок может давать десятки событий в секунду.
+# Схлопываем короткий burst в один redraw, чтобы UI не "рвало".
+_NAV_BURST_WINDOW_SEC = 0.012
+_NAV_BURST_MAX_KEYS = 64
 
 
 _PLAY_LOG = Path(__file__).resolve().parent / "cache" / "play.log"
@@ -245,16 +266,94 @@ def _read_fresh(path: Path, ttl: int) -> dict | None:
     return None
 
 
-def load_feed_combined() -> tuple[list[feed_mod.Video], list[str]]:
-    """Fetch home + /next-pivot for the first home video, merge & dedupe.
+def _fetch_home_enriched(it: innertube.InnerTube,
+                         *, max_continuation_pages: int = 0) -> feed_mod.Feed:
+    """Home feed, optionally plus continuation pages (more shelves)."""
+    home = feed_mod.parse_home(it.home())
+    shelves = list(home.shelves)
+    cont = home.continuation
+    pages = 0
+    while cont and pages < max_continuation_pages:
+        more = feed_mod.parse_browse_continuation(
+            it.browse("FEwhat_to_watch", continuation=cont))
+        shelves.extend(more.shelves)
+        cont = more.continuation
+        pages += 1
+    return feed_mod.Feed(shelves=shelves, continuation=cont)
 
-    Why combined: TVHTML5 home is just 4 shelves × 5 = 20 videos with no
-    continuation. The watch-next `pivot` of any video gives 10 more
-    shelves × 3 = ~30 contextual recommendations — far richer.
 
-    Returns: (videos, shelf_of) — flat lists; shelf_of[i] is the name
-    of the shelf videos[i] came from (used in the header bar).
+def _fetch_pivot_merged(it: innertube.InnerTube,
+                        seed_ids: list[str]) -> feed_mod.Feed:
+    """Merge ``/next`` pivot shelves from several seed videos."""
+    merged_shelves: list[feed_mod.Shelf] = []
+    for seed in seed_ids:
+        try:
+            pivot = feed_mod.parse_next_pivot(it.next(seed))
+            merged_shelves.extend(pivot.shelves)
+        except Exception as e:
+            print(f"[grid] pivot {seed} failed: {e}", file=sys.stderr)
+    return feed_mod.Feed(shelves=merged_shelves)
+
+
+def _log_session(msg: str) -> None:
+    SESSION_LOG.parent.mkdir(parents=True, exist_ok=True)
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n"
+    with SESSION_LOG.open("a", encoding="utf-8") as f:
+        f.write(line)
+    print(f"[grid] {msg}", file=sys.stderr)
+
+
+def set_status_banner(msg: str, *, secs: float = 8.0) -> None:
+    global _status_banner, _status_banner_until
+    _status_banner = msg
+    _status_banner_until = time.time() + secs
+
+
+def load_feed_combined(
+    *,
+    refresh: bool = False,
+    exclude_ids: set[str] | None = None,
+) -> tuple[list[feed_mod.Video], list[str]]:
+    """Fetch home + pivot recommendations, merge for the grid.
+
+    Normal load: cache-friendly, one random pivot seed, home block then pivot.
+    Refresh (``r``): no cache, home + up to 2 continuation pages, several
+    pivot seeds, shelves interleaved like YouTube's mixed rows.
     """
+    if refresh:
+        with innertube.InnerTube() as it:
+            home = _fetch_home_enriched(it, max_continuation_pages=2)
+            if home.shelves:
+                random.shuffle(home.shelves)
+            seeds = feed_mod.pivot_seed_ids(home, max_seeds=6)
+            pivot = _fetch_pivot_merged(it, seeds) if seeds else feed_mod.Feed()
+            videos, shelf_of = feed_mod.merge_feeds_for_grid(
+                [home, pivot], interleave=True)
+        if exclude_ids:
+            pairs = [(v, s) for v, s in zip(videos, shelf_of)
+                     if v.video_id not in exclude_ids]
+            random.shuffle(pairs)
+            if len(pairs) < 12:
+                back = [(v, s) for v, s in zip(videos, shelf_of)
+                        if v.video_id in exclude_ids]
+                random.shuffle(back)
+                need = min(len(back), 12 - len(pairs))
+                pairs.extend(back[:need])
+            if pairs:
+                videos, shelf_of = map(list, zip(*pairs))
+            else:
+                videos, shelf_of = [], []
+        else:
+            pairs = list(zip(videos, shelf_of))
+            random.shuffle(pairs)
+            if pairs:
+                videos, shelf_of = map(list, zip(*pairs))
+        _log_session(
+            f"refresh: {len(home.shelves)} home shelves, "
+            f"{len(seeds)} pivot seeds → {len(videos)} videos"
+            + (f" (без {len(exclude_ids)} старых)" if exclude_ids else ""))
+        return videos, shelf_of
+
     raw_home = _read_fresh(HOME_CACHE, HOME_TTL_SECS)
     if raw_home is None:
         with innertube.InnerTube() as it:
@@ -262,9 +361,6 @@ def load_feed_combined() -> tuple[list[feed_mod.Video], list[str]]:
         HOME_CACHE.write_text(json.dumps(raw_home, ensure_ascii=False))
     home = feed_mod.parse_home(raw_home)
 
-    # Pick a random home video as the seed for `/next`. Different seed
-    # each launch → different pivot recommendations each launch, which
-    # is what the user actually means by "fresh on reload".
     all_home_videos = [v for sh in home.shelves for v in sh.videos]
     seed_id: str | None = None
     if all_home_videos:
@@ -279,26 +375,7 @@ def load_feed_combined() -> tuple[list[feed_mod.Video], list[str]]:
             NEXT_CACHE.write_text(json.dumps(raw_next, ensure_ascii=False))
         pivot = feed_mod.parse_next_pivot(raw_next)
 
-    # Merge in order: home shelves first (personalized), then pivot
-    # (contextual). Dedupe by video_id keeping first occurrence.
-    seen: set[str] = set()
-    videos: list[feed_mod.Video] = []
-    shelf_of: list[str] = []
-    for sh in home.shelves:
-        for v in sh.videos:
-            if v.video_id in seen:
-                continue
-            seen.add(v.video_id)
-            videos.append(v)
-            shelf_of.append(sh.title)
-    for sh in pivot.shelves:
-        for v in sh.videos:
-            if v.video_id in seen:
-                continue
-            seen.add(v.video_id)
-            videos.append(v)
-            shelf_of.append(sh.title.strip() or "Up next")
-    return videos, shelf_of
+    return feed_mod.merge_feeds_for_grid([home, pivot], interleave=False)
 
 
 def _seed_of(raw_next: dict) -> str | None:
@@ -314,7 +391,7 @@ def _seed_of(raw_next: dict) -> str | None:
 # --- layout ---------------------------------------------------------------
 
 
-def compute_layout(ts: terminal.TermSize, target_tile_w: int = 36):
+def compute_layout(ts: terminal.TermSize, target_tile_w: int = 32):
     """Compute grid that fills the screen with tiles ~target_tile_w cells wide.
 
     Aspect 16:9 in pixels; tile_h derived from kitty's reported cell px size
@@ -325,7 +402,7 @@ def compute_layout(ts: terminal.TermSize, target_tile_w: int = 36):
     """
     cell_w = ts.cell_w or 9
     cell_h = ts.cell_h or 18
-    gutter = 3
+    gutter = 2
     top_margin = 2
     bottom_margin = 2
     side_margin = 2
@@ -337,7 +414,7 @@ def compute_layout(ts: terminal.TermSize, target_tile_w: int = 36):
     tile_h_px = tile_w * cell_w * 9 / 16
     tile_h = max(3, int(tile_h_px / cell_h))
     text_rows = 2
-    min_row_gap = 2   # baseline gap between rows
+    min_row_gap = 1   # плотнее вертикально: на средних экранах чаще влезает 3 ряда
     row_content = tile_h + text_rows
 
     rows_available = ts.rows - top_margin - bottom_margin
@@ -346,15 +423,9 @@ def compute_layout(ts: terminal.TermSize, target_tile_w: int = 36):
         1,
         (rows_available + min_row_gap) // (row_content + min_row_gap),
     )
-    # Spread the leftover rows back into the inter-row gaps so the grid
-    # vertically fills the screen rather than leaving a void at the bottom.
-    used = n_rows * row_content + max(0, n_rows - 1) * min_row_gap
-    leftover = max(0, rows_available - used)
-    if n_rows > 1:
-        extra_gap = leftover // (n_rows - 1)
-    else:
-        extra_gap = 0
-    row_gap = min_row_gap + extra_gap
+    # Не размазываем leftover в межрядные зазоры: большие "дырки" между рядами
+    # визуально ломают сетку и оставляют место для артефактов рамки.
+    row_gap = min_row_gap
     row_total = row_content + row_gap
 
     return {
@@ -517,9 +588,15 @@ def clear_slot(layout: dict, slot_idx: int) -> None:
     clear_focus_border(row, col, w, layout["tile_h"])
 
 
-def redraw_grid(layout: dict, videos, shelf_of, offset: int,
+def redraw_grid(layout: dict, ts: terminal.TermSize, videos, shelf_of, offset: int,
                 focus: int) -> None:
     """Redraw every visible slot for the current offset & focus."""
+    # Полная очистка рабочей области (всё между шапкой и статусом).
+    # Это добивает любые хвосты по краям экрана после быстрых переходов.
+    for r in range(2, max(2, ts.rows - 1)):
+        graphics.move_cursor(r, 1)
+        writes(" " * ts.cols)
+
     cap = layout["n_cols"] * layout["n_rows"]
     for slot in range(cap):
         global_idx = offset + slot
@@ -530,23 +607,54 @@ def redraw_grid(layout: dict, videos, shelf_of, offset: int,
             clear_slot(layout, slot)
 
 
-def draw_header(layout: dict, shelf_title: str, idx: int, total: int) -> None:
+def draw_header(layout: dict, ts: terminal.TermSize,
+                header_title: str, idx: int, total: int) -> None:
+    """Top chrome row. Keep it stable while moving focus."""
+    graphics.move_cursor(1, 1)
+    writes("\033[2K")
     graphics.move_cursor(1, 2)
-    writes("\033[1;96m" + clamp(f"YouTube — {shelf_title}", 70) + "\033[0m")
-    graphics.move_cursor(1, 80)
+    writes("\033[1;96m" + clamp(f"YouTube — {header_title}", 70) + "\033[0m")
+    graphics.move_cursor(1, max(2, ts.cols - 14))
     writes(f"\033[90m[{idx + 1}/{total}]\033[0m")
 
 
+def _status_hotkey_hint(cols: int) -> str:
+    """Строка подсказок, влезающая в ширину терминала."""
+    for hint in reversed(_STATUS_HOTKEYS):
+        if len(hint) <= max(cols - 2, 0):
+            return hint
+    return _STATUS_HOTKEYS[0][: max(cols - 2, 0)]
+
+
+def _fill_status_line(row: int, cols: int, text: str, style: str) -> None:
+    """Одна строка статуса на всю ширину терминала с заливкой фона."""
+    graphics.move_cursor(row, 1)
+    writes("\033[2K")
+    bar = text.ljust(cols)[:cols]
+    writes(style)
+    writes(bar)
+    writes("\033[0m")
+
+
 def draw_status(ts: terminal.TermSize, video: feed_mod.Video, last_key: str = "") -> None:
-    graphics.move_cursor(ts.rows, 1)
-    writes("\033[2K")  # clear line
-    head = f" {video.title}"
-    tail = f" [key={last_key or '·'}] hjkl/arrows · Enter · q "
-    space = ts.cols - len(tail) - 2
-    if space < 10:
-        space = 10
-    head = clamp(head, space)
-    writes(f"\033[7m{head}{' ' * max(0, space - len(head))}{tail}\033[0m")
+    """Нижние 2 строки: подсказки (тёмная полоса) + заголовок (инверсия)."""
+    global _status_banner, _status_banner_until
+    hint = _status_hotkey_hint(max(ts.cols - 2, 0))
+    if _status_banner and time.time() < _status_banner_until:
+        banner = clamp(_status_banner, max(ts.cols // 2, 20))
+        hint = f"{banner} · {hint}"
+    elif _status_banner:
+        _status_banner = ""
+    if ts.rows >= 2:
+        _fill_status_line(ts.rows - 1, ts.cols, hint, _STATUS_HINT_STYLE)
+
+    tail = f" [{last_key}]" if last_key else ""
+    space = ts.cols - len(tail)
+    if space < 8:
+        space = 8
+    head = clamp(f" {video.title}", space)
+    title_bar = f"{head}{tail}"
+    _fill_status_line(ts.rows, ts.cols, title_bar, _STATUS_TITLE_STYLE)
 
 
 # --- connecting animation -------------------------------------------------
@@ -831,10 +939,18 @@ class SearchOverlay:
 
 
 def run_search(query: str) -> tuple[list[feed_mod.Video], list[str]]:
-    """Run a TVHTML5 search and flatten the result into a feed snapshot."""
+    """InnerTube search (TV, then WEB context if TV returned nothing)."""
     with innertube.InnerTube() as it:
         raw = it.search(query)
-    parsed = feed_mod.parse_search(raw)
+        parsed = feed_mod.parse_search(raw)
+        n = sum(len(sh.videos) for sh in parsed.shelves)
+        if n == 0:
+            raw = it.search_web(query)
+            parsed = feed_mod.parse_search(raw)
+            n = sum(len(sh.videos) for sh in parsed.shelves)
+            _log_session(f"search «{query}»: WEB fallback → {n} videos")
+        else:
+            _log_session(f"search «{query}»: TV → {n} videos")
     videos: list[feed_mod.Video] = []
     shelf_of: list[str] = []
     label = f"Поиск: {query}"
@@ -852,12 +968,10 @@ def run_search(query: str) -> tuple[list[feed_mod.Video], list[str]]:
 # --- reload helper --------------------------------------------------------
 
 
-def reload_feed() -> tuple[list[feed_mod.Video], list[str]]:
-    """Fresh fetch for the r/к reload key.
-
-    Drops the home + next caches so we genuinely refetch, then reuses
-    `load_feed_combined` so the merge/dedupe logic stays in one place.
-    """
+def reload_feed(
+    exclude_ids: set[str] | None = None,
+) -> tuple[list[feed_mod.Video], list[str]]:
+    """Fresh fetch for the r/к reload key — YouTube-like mixed refresh."""
     for p in (HOME_CACHE, NEXT_CACHE):
         try:
             p.unlink()
@@ -865,7 +979,7 @@ def reload_feed() -> tuple[list[feed_mod.Video], list[str]]:
             pass
         except OSError:
             pass
-    return load_feed_combined()
+    return load_feed_combined(refresh=True, exclude_ids=exclude_ids)
 
 
 # --- main loop ------------------------------------------------------------
@@ -885,6 +999,26 @@ def scroll_offset_for(focus: int, offset: int, layout: dict) -> int:
 
 def clamp_focus(focus: int, n: int) -> int:
     return max(0, min(focus, n - 1))
+
+
+def _apply_nav_key(cur_focus: int, key: str, *, n_cols: int, cap: int,
+                   total: int) -> int | None:
+    """Return updated focus for one nav key; None if key isn't navigation."""
+    if key in (terminal.KEY_LEFT, "h"):
+        return max(0, cur_focus - 1)
+    if key in (terminal.KEY_RIGHT, "l"):
+        return min(total - 1, cur_focus + 1)
+    if key in (terminal.KEY_UP, "k"):
+        return max(0, cur_focus - n_cols)
+    if key in (terminal.KEY_DOWN, "j"):
+        return min(total - 1, cur_focus + n_cols)
+    if key == terminal.KEY_PGUP:
+        return max(0, cur_focus - cap)
+    if key == terminal.KEY_PGDN:
+        return min(total - 1, cur_focus + cap)
+    if key == terminal.KEY_HOME:
+        return 0
+    return None
 
 
 def main() -> int:
@@ -919,6 +1053,7 @@ def main() -> int:
     layout = compute_layout(ts)
     focus = 0
     offset = 0
+    header_title = "Рекомендованные"
     last_key = ""
     crash_info: str | None = None
     focus_changed_at = time.time()
@@ -932,9 +1067,9 @@ def main() -> int:
             graphics.delete_all()
             graphics.clear_screen()
             if videos:
-                draw_header(layout, shelf_of[focus],
+                draw_header(layout, ts, header_title,
                             focus, len(videos))
-                redraw_grid(layout, videos, shelf_of, offset, focus)
+                redraw_grid(layout, ts, videos, shelf_of, offset, focus)
                 draw_status(ts, videos[focus], last_key=last_key)
             W.flush()
 
@@ -964,6 +1099,7 @@ def main() -> int:
 
     KEY_LOG.parent.mkdir(parents=True, exist_ok=True)
     key_log = KEY_LOG.open("w")
+    queued_key: str | None = None
     try:
         with terminal.KeyReader() as keys:
             while True:
@@ -1010,7 +1146,11 @@ def main() -> int:
                                                 focus - offset, layout),
                             )
 
-                k = keys.read(timeout=0.2)
+                if queued_key is not None:
+                    k = queued_key
+                    queued_key = None
+                else:
+                    k = keys.read(timeout=0.2)
                 if k is None:
                     continue
                 last_key = k
@@ -1050,15 +1190,14 @@ def main() -> int:
                                 W.flush()
                             continue
                         if not new_v:
+                            set_status_banner(
+                                f"По запросу «{query}» ничего не найдено")
                             full_redraw()
-                            with _screen_lock:
-                                graphics.move_cursor(ts.rows, 1)
-                                writes("\033[2K\033[93m"
-                                       "  По запросу ничего не "
-                                       "найдено.\033[0m")
-                                W.flush()
                             continue
                         loader.replace(new_v, new_s)
+                        set_status_banner(
+                            f"Найдено: {len(new_v)} · «{clamp(query, 30)}»")
+                        header_title = f"Поиск: {clamp(query, 32)}"
                         videos, shelf_of = loader.snapshot()
                         focus = 0
                         offset = 0
@@ -1113,7 +1252,8 @@ def main() -> int:
                                "  Обновляем ленту…\033[0m")
                         W.flush()
                     try:
-                        new_v, new_s = reload_feed()
+                        old_ids = {v.video_id for v in videos}
+                        new_v, new_s = reload_feed(exclude_ids=old_ids)
                     except Exception as e:
                         with _screen_lock:
                             graphics.move_cursor(ts.rows, 1)
@@ -1125,11 +1265,16 @@ def main() -> int:
                     loader.resume()
                     if new_v:
                         loader.replace(new_v, new_s)
+                        header_title = "Рекомендованные"
                         videos, shelf_of = loader.snapshot()
                         focus = 0
                         offset = 0
                         thumbnails.prefetch(
                             [v.video_id for v in videos[:60]])
+                        set_status_banner(
+                            f"Обновлено: {len(new_v)} видео · лог: cache/session.log")
+                    else:
+                        set_status_banner("Не удалось обновить ленту")
                     full_redraw()
                     focus_changed_at = time.time()
                     continue
@@ -1179,23 +1324,33 @@ def main() -> int:
                     focus_changed_at = time.time()
                     continue
 
-                new_focus = focus
                 n_cols = layout["n_cols"]
                 cap = n_cols * layout["n_rows"]
-                if k in (terminal.KEY_LEFT, "h"):
-                    new_focus = max(0, focus - 1)
-                elif k in (terminal.KEY_RIGHT, "l"):
-                    new_focus = min(len(videos) - 1, focus + 1)
-                elif k in (terminal.KEY_UP, "k"):
-                    new_focus = max(0, focus - n_cols)
-                elif k in (terminal.KEY_DOWN, "j"):
-                    new_focus = min(len(videos) - 1, focus + n_cols)
-                elif k == terminal.KEY_PGUP:
-                    new_focus = max(0, focus - cap)
-                elif k == terminal.KEY_PGDN:
-                    new_focus = min(len(videos) - 1, focus + cap)
-                elif k == terminal.KEY_HOME:
-                    new_focus = 0
+                new_focus = _apply_nav_key(
+                    focus, k, n_cols=n_cols, cap=cap, total=len(videos))
+                if new_focus is None:
+                    with _screen_lock:
+                        draw_status(ts, videos[focus], last_key=last_key)
+                        W.flush()
+                    continue
+
+                # Collapse buffered key-repeat burst into one final focus.
+                burst_deadline = time.time() + _NAV_BURST_WINDOW_SEC
+                burst_count = 0
+                while burst_count < _NAV_BURST_MAX_KEYS and time.time() < burst_deadline:
+                    k2 = keys.read(timeout=0.0)
+                    if k2 is None:
+                        break
+                    key_log.write(f"{time.time():.3f}  k={k2!r}\n")
+                    key_log.flush()
+                    nxt = _apply_nav_key(
+                        new_focus, k2, n_cols=n_cols, cap=cap, total=len(videos))
+                    if nxt is None:
+                        queued_key = k2
+                        break
+                    last_key = k2
+                    new_focus = nxt
+                    burst_count += 1
 
                 if new_focus == focus:
                     with _screen_lock:
@@ -1209,23 +1364,14 @@ def main() -> int:
                 preview_player.stop()
 
                 new_offset = scroll_offset_for(new_focus, offset, layout)
+                offset = new_offset
+                focus = new_focus
+                # Надёжнее частичных дельта-апдейтов: перерисовываем весь
+                # видимый viewport. Чуть дороже, зато без "жёлтых хвостов"
+                # рамки при быстрых переходах вверх/вниз/влево/вправо.
                 with _screen_lock:
-                    if new_offset != offset:
-                        offset = new_offset
-                        focus = new_focus
-                        draw_header(layout, shelf_of[focus], focus, len(videos))
-                        redraw_grid(layout, videos, shelf_of, offset, focus)
-                    else:
-                        old_slot = focus - offset
-                        new_slot = new_focus - offset
-                        old_row, old_col = tile_origin(layout, old_slot)
-                        clear_focus_border(old_row, old_col,
-                                           layout["tile_w"], layout["tile_h"])
-                        draw_tile(layout, old_slot, videos[focus], focused=False)
-                        draw_tile(layout, new_slot, videos[new_focus], focused=True)
-                        draw_header(layout, shelf_of[new_focus],
-                                    new_focus, len(videos))
-                        focus = new_focus
+                    draw_header(layout, ts, header_title, focus, len(videos))
+                    redraw_grid(layout, ts, videos, shelf_of, offset, focus)
                     draw_status(ts, videos[focus], last_key=last_key)
                     W.flush()
                 focus_changed_at = time.time()

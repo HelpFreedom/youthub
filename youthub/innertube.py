@@ -27,6 +27,9 @@ CLIENT_NAME = "TVHTML5"
 CLIENT_VERSION = "7.20250122.14.00"
 CLIENT_NAME_HEADER = "7"  # X-YouTube-Client-Name for TVHTML5
 
+# InnerTube search filter: results type «Videos» (works for TV + WEB bodies).
+SEARCH_PARAMS_VIDEOS = "EgIQAQ=="
+
 USER_AGENT = (
     "Mozilla/5.0 (PlayStation; PlayStation 4/12.50) AppleWebKit/605.1.15 "
     "(KHTML, like Gecko) Version/13.1.2 Safari/605.1.15"
@@ -136,9 +139,50 @@ class InnerTube:
             body["continuation"] = continuation
         else:
             body["query"] = query
-            if params:
-                body["params"] = params
+            body["params"] = params if params is not None else SEARCH_PARAMS_VIDEOS
         return self._post("search", body)
+
+    def search_web(self, query: str, *, params: Optional[str] = None,
+                   continuation: Optional[str] = None) -> dict:
+        """Search with WEB client context — richer results than bare TV search."""
+        self._ensure_fresh()
+        body: dict[str, Any] = {}
+        if continuation:
+            body["continuation"] = continuation
+        else:
+            body["query"] = query
+            body["params"] = params if params is not None else SEARCH_PARAMS_VIDEOS
+        ctx = {
+            "client": {
+                "clientName": "WEB",
+                "clientVersion": "2.20250222.10.00",
+                "hl": "ru",
+                "gl": "RU",
+                "userAgent": (
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
+                ),
+            },
+            "user": {"lockedSafetyMode": False},
+            "request": {"useSsl": True},
+        }
+        full = {"context": ctx, **body}
+        headers = {"Authorization": f"Bearer {self._tokens.access_token}"}
+        r = self._http.post(
+            f"{BASE}/search",
+            headers=headers,
+            content=json.dumps(full).encode(),
+        )
+        if r.status_code == 401:
+            self._tokens = auth.refresh(self._tokens)
+            headers["Authorization"] = f"Bearer {self._tokens.access_token}"
+            r = self._http.post(
+                f"{BASE}/search",
+                headers=headers,
+                content=json.dumps(full).encode(),
+            )
+        r.raise_for_status()
+        return r.json()
 
     def next(self, video_id: str, *,
              continuation: Optional[str] = None) -> dict:
