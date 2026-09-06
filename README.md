@@ -144,6 +144,54 @@ export HTTPS_PROXY="socks5://127.0.0.1:1080"
 
 ---
 
+## macOS (Apple Silicon)
+
+Проект писался под Linux/X11, но целиком работает на нативном macOS (проверено на
+macOS 15.6, arm64). Отличия от инструкции выше:
+
+### Зависимости через Homebrew
+
+```bash
+brew install --cask kitty font-dejavu
+brew install python@3.11 node ffmpeg            # рантайм
+brew install sdl2 dav1d opus pkgconf libtool    # для сборки ffplay-yt
+```
+
+`nasm` не нужен — он только для x86-ассемблера, на arm64 сборка идёт без него.
+`xdotool`/`wmctrl` поставить нельзя (это утилиты X11). Без них видео всё равно
+играет в своём окне через нативные флаги ffplay (`-alwaysontop`, `-window_title`,
+`-x/-y`); не работают лишь автофокус и оверлей-тоггл `bin/yt-toggle-overlay`
+(см. ниже).
+
+### Сборка ffplay-yt на macOS
+
+Шаги те же, что в разделе 4, но с тремя правками:
+
+1. **Патч dav1d.** Homebrew ставит dav1d 1.x, где из `Dav1dSettings` убрали
+   `n_tile_threads`/`n_frame_threads` и макросы `DAV1D_MAX_TILE_THREADS`/
+   `DAV1D_MAX_FRAME_THREADS`. Перед сборкой в `libavcodec/libdav1d.c` функцию
+   `libdav1d_init` нужно перевести на единый `s.n_threads` (+ `s.max_frame_delay`),
+   а в таблице `AVOption` заменить удалённые макросы на `DAV1D_MAX_THREADS` —
+   ровно как это сделано в FFmpeg 5.x.
+2. **configure:** убрать `--enable-indev=alsa` (Linux-only; звук идёт через SDL2),
+   добавить `--cc=clang --extra-cflags=-I/opt/homebrew/include
+   --extra-ldflags=-L/opt/homebrew/lib` и экспортировать
+   `PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig`.
+3. **make:** `make ffplay -j$(sysctl -n hw.ncpu)` (на macOS нет `nproc`).
+
+Бинарник кладётся в `ffplay-yt/bin/ffplay-yt` (как и на Linux).
+
+### venv на Python ≠ 3.11
+
+`sabr_bridge.mjs` и `bridge_player.py` жёстко зовут `.venv/bin/python3.11`. Если
+venv создан другой версией Python (например 3.14), добавьте симлинк:
+
+```bash
+ln -sf "$(basename $(readlink .venv/bin/python3))" .venv/bin/python3.11
+```
+
+---
+
 ## Запуск
 
 ```bash
